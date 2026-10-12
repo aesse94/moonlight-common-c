@@ -1,5 +1,8 @@
 #include "Limelight-internal.h"
 
+#include <stdio.h>
+#include <time.h>
+
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
@@ -82,12 +85,190 @@ static void VideoPingThreadProc(void* context) {
 }
 
 // Receive thread proc
+// FrogtaleTV patch: cross-frame reorder hold for satellite links.
+//
+// Starlink stalls video for ~30-50 ms at each 15 s satellite handoff and then delivers the
+// backlog, partly out of order. RtpVideoQueue only holds the current FEC block, so a single
+// packet of a later block arriving before the current block completes makes it drop the
+// current frame, and the stragglers that arrive a moment later are rejected as "behind".
+// Every handoff then costs an RFI/IDR (a visible stutter) even though the data arrived.
+//
+// While the current block is incomplete, hold packets for later blocks for up to
+// FROGTALE_REORDER_MS (default 80, 0 = stock behaviour) so stragglers can complete it first.
+// In-order traffic is never delayed. Each hold is logged to FROGTALE_REORDER_LOG
+// (default $XDG_CACHE_HOME/frogtale-reorder.log) as: epoch_ms outcome held_ms packets frame.
+#define REORDER_MAX_HELD 4096
+
+typedef struct _HELD_PACKET {
+    char* buffer;
+    int length;
+} HELD_PACKET;
+
+static HELD_PACKET heldPackets[REORDER_MAX_HELD];
+static int heldCount;
+static uint64_t holdStartUs;
+static uint32_t holdStartFrame;
+static int reorderHoldMs;
+static int reorderBufferOffset;
+static FILE* reorderLog;
+static struct {
+    uint32_t holds, resolved, timedOut, overflowed;
+    uint64_t maxResolvedUs;
+} reorderStats;
+
+static uint64_t epochMillis(void) {
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) == 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void reorderInit(int bufferOffset) {
+    const char* ms = getenv("FROGTALE_REORDER_MS");
+    reorderHoldMs = ms ? atoi(ms) : 80;
+    reorderBufferOffset = bufferOffset;
+    heldCount = 0;
+    memset(&reorderStats, 0, sizeof(reorderStats));
+
+    const char* path = getenv("FROGTALE_REORDER_LOG");
+    char defaultPath[512];
+    if (path == NULL) {
+        const char* cache = getenv("XDG_CACHE_HOME");
+        snprintf(defaultPath, sizeof(defaultPath), "%s/frogtale-reorder.log", cache ? cache : "/tmp");
+        path = defaultPath;
+    }
+    reorderLog = fopen(path, "a");
+    if (reorderLog != NULL) {
+        setvbuf(reorderLog, NULL, _IOLBF, 0);
+        fprintf(reorderLog, "%llu start hold_ms=%d\n", (unsigned long long)epochMillis(), reorderHoldMs);
+    }
+    Limelog("FrogtaleTV reorder hold: %d ms\n", reorderHoldMs);
+}
+
+// <0 behind the block the queue is assembling, 0 that block, >0 a later block.
+static int compareToCurrentBlock(char* buffer, int length) {
+    PRTP_PACKET packet = (PRTP_PACKET)buffer;
+    int dataOffset = sizeof(*packet) + ((packet->header & FLAG_EXTENSION) ? 4 : 0);
+    if (length < dataOffset + (int)sizeof(NV_VIDEO_PACKET)) {
+        // RtpvAddPacket() rejects these anyway; never hold them.
+        return 0;
+    }
+
+    PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(buffer + dataOffset);
+    int16_t frameDelta = (int16_t)U16(LE32(nvPacket->frameIndex) - rtpQueue.currentFrameNumber);
+    if (frameDelta != 0) {
+        return frameDelta;
+    }
+    return (int)((nvPacket->multiFecBlocks >> 4) & 0x3) - (int)rtpQueue.multiFecCurrentBlockNumber;
+}
+
+static void submitPacket(char* buffer, int length) {
+    if (RtpvAddPacket(&rtpQueue, (PRTP_PACKET)buffer, length,
+                      (PRTPV_QUEUE_ENTRY)&buffer[reorderBufferOffset]) != RTPF_RET_QUEUED) {
+        free(buffer);
+    }
+}
+
+static void logHold(const char* outcome, uint64_t heldUs, int packets) {
+    if (reorderLog != NULL) {
+        fprintf(reorderLog, "%llu %s %u %d %u\n", (unsigned long long)epochMillis(), outcome,
+                (unsigned int)(heldUs / 1000), packets, holdStartFrame);
+    }
+}
+
+// Release every held packet the queue can now take, in arrival order. With force, release
+// all of them, which reproduces stock behaviour (the incomplete block is dropped).
+static void reorderDrain(bool force) {
+    bool progress;
+    do {
+        progress = false;
+        int kept = 0;
+        for (int i = 0; i < heldCount; i++) {
+            if (force || compareToCurrentBlock(heldPackets[i].buffer, heldPackets[i].length) <= 0) {
+                submitPacket(heldPackets[i].buffer, heldPackets[i].length);
+                progress = true;
+            }
+            else {
+                heldPackets[kept++] = heldPackets[i];
+            }
+        }
+        heldCount = kept;
+    } while (progress && heldCount > 0);
+}
+
+static void reorderProcess(char* buffer, int length) {
+    if (reorderHoldMs <= 0) {
+        submitPacket(buffer, length);
+        return;
+    }
+
+    if (compareToCurrentBlock(buffer, length) <= 0) {
+        submitPacket(buffer, length);
+        if (heldCount > 0) {
+            int before = heldCount;
+            reorderDrain(false);
+            if (heldCount == 0) {
+                uint64_t heldUs = PltGetMicroseconds() - holdStartUs;
+                reorderStats.resolved++;
+                if (heldUs > reorderStats.maxResolvedUs) {
+                    reorderStats.maxResolvedUs = heldUs;
+                }
+                logHold("resolved", heldUs, before);
+            }
+        }
+        return;
+    }
+
+    if (heldCount == REORDER_MAX_HELD) {
+        reorderStats.overflowed++;
+        logHold("overflow", PltGetMicroseconds() - holdStartUs, heldCount);
+        reorderDrain(true);
+        submitPacket(buffer, length);
+        return;
+    }
+
+    if (heldCount == 0) {
+        holdStartUs = PltGetMicroseconds();
+        holdStartFrame = rtpQueue.currentFrameNumber;
+        reorderStats.holds++;
+    }
+    heldPackets[heldCount].buffer = buffer;
+    heldPackets[heldCount].length = length;
+    heldCount++;
+}
+
+static void reorderCheckTimeout(void) {
+    if (heldCount > 0) {
+        uint64_t heldUs = PltGetMicroseconds() - holdStartUs;
+        if (heldUs >= (uint64_t)reorderHoldMs * 1000) {
+            reorderStats.timedOut++;
+            logHold("timeout", heldUs, heldCount);
+            reorderDrain(true);
+        }
+    }
+}
+
+static void reorderCleanup(void) {
+    for (int i = 0; i < heldCount; i++) {
+        free(heldPackets[i].buffer);
+    }
+    heldCount = 0;
+    if (reorderLog != NULL) {
+        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u\n",
+                (unsigned long long)epochMillis(), reorderStats.holds, reorderStats.resolved,
+                reorderStats.timedOut, reorderStats.overflowed,
+                (unsigned int)(reorderStats.maxResolvedUs / 1000));
+        fclose(reorderLog);
+        reorderLog = NULL;
+    }
+}
+
 static void VideoReceiveThreadProc(void* context) {
     int err;
     int bufferSize, receiveSize, decryptedSize, minSize;
     char* buffer;
     char* encryptedBuffer;
-    int queueStatus;
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
@@ -121,9 +302,13 @@ static void VideoReceiveThreadProc(void* context) {
         encryptedBuffer = NULL;
     }
 
+    reorderInit(decryptedSize);
+
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+
+        reorderCheckTimeout();
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -227,13 +412,12 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
-
-        if (queueStatus == RTPF_RET_QUEUED) {
-            // The queue owns the buffer
-            buffer = NULL;
-        }
+        // The reorder stage owns the buffer from here: it either queues, holds or frees it.
+        reorderProcess(buffer, err);
+        buffer = NULL;
     }
+
+    reorderCleanup();
 
     if (buffer != NULL) {
         free(buffer);
