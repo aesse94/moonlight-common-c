@@ -1,7 +1,6 @@
 #include "Limelight-internal.h"
 
 #include <stdio.h>
-#include <time.h>
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -116,12 +115,18 @@ static struct {
     uint64_t maxResolvedUs;
 } reorderStats;
 
+// Wall clock, so holds can be lined up with Starlink's :12/:27/:42/:57 handoff schedule.
 static uint64_t epochMillis(void) {
-    struct timespec ts;
-    if (timespec_get(&ts, TIME_UTC) == 0) {
-        return 0;
-    }
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return t / 10000 - 11644473600000ULL;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#endif
 }
 
 static void reorderInit(int bufferOffset) {
