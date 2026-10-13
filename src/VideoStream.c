@@ -106,6 +106,7 @@ typedef struct _HELD_PACKET {
 static HELD_PACKET heldPackets[REORDER_MAX_HELD];
 static int heldCount;
 static uint64_t holdStartUs;
+static uint64_t holdSuppressedUntilUs;
 static uint32_t holdStartFrame;
 static int reorderHoldMs;
 static int reorderBufferOffset;
@@ -269,6 +270,7 @@ static void reorderInit(int bufferOffset) {
     reorderHoldMs = ms ? atoi(ms) : (nackEnabled ? 100 : 80);
     reorderBufferOffset = bufferOffset;
     heldCount = 0;
+    holdSuppressedUntilUs = 0;
     memset(&reorderStats, 0, sizeof(reorderStats));
 
     const char* path = getenv("FROGTALE_REORDER_LOG");
@@ -342,7 +344,10 @@ static void reorderProcess(char* buffer, int length) {
         nackObserve(buffer);
     }
 
-    if (reorderHoldMs <= 0) {
+    // After a hold times out the link is in a long outage; further holds would only stack
+    // another reorderHoldMs each (5 in a row = ~0.5 s of extra freeze), so let the stock RFI
+    // path recover for a second before holding again.
+    if (reorderHoldMs <= 0 || PltGetMicroseconds() < holdSuppressedUntilUs) {
         submitPacket(buffer, length);
         return;
     }
@@ -393,6 +398,7 @@ static void reorderCheckTimeout(void) {
             reorderStats.timedOut++;
             logHold("timeout", heldUs, heldCount);
             reorderDrain(true);
+            holdSuppressedUntilUs = PltGetMicroseconds() + 1000000;
         }
     }
 }
