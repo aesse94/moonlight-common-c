@@ -229,6 +229,129 @@ static void nackRetry(void) {
     nackOutstandingCount = kept;
 }
 
+// FrogtaleTV patch: report queueing delay so the host can back off before packets are lost.
+//
+// GeForce Now (WebRTC) estimates bandwidth from one-way delay: when another stream fills the
+// Starlink link, a queue builds and packets arrive later and later well before any are dropped.
+// Until now this fork only reacted to loss. Every video packet carries its capture time (90 kHz
+// RTP timestamp), so arrival time minus that is the one-way delay plus an unknown clock offset,
+// and its minimum over the last few seconds is the empty-queue baseline. Every 250 ms the median
+// over first packets of new frames, minus that baseline, goes to the host as "FTDL", uint16
+// queue_ms, uint16 samples (little endian). Resends and handoff copies carry old timestamps and
+// never advance the highest sequence number, so they are not sampled. FROGTALE_DELAY=0 disables.
+#define DELAY_REPORT_US 250000
+#define DELAY_BASE_SLOTS 6 // one minimum per second: the baseline covers the last 6 s
+#define DELAY_MAX_SAMPLES 64
+static bool delayEnabled;
+static bool delayHaveTs;
+static uint32_t delayLastTs;
+static int64_t delayTsTicks; // unwrapped RTP timestamp
+static int64_t delayBase[DELAY_BASE_SLOTS];
+static int delayBaseSlot;
+static uint64_t delayBaseSlotStartUs;
+static int64_t delaySamples[DELAY_MAX_SAMPLES];
+static int delaySampleCount;
+static uint64_t delayReportStartUs;
+static uint32_t delayReports, delayHighReports;
+static uint16_t delayMaxQueueMs;
+
+static void delaySend(uint16_t queueMs, uint16_t samples) {
+    // "FTDL", uint16 queue_ms, uint16 samples, little endian. 8 bytes, so a stock host (which only
+    // looks at 4-byte and SS_PING-sized datagrams) ignores it.
+    unsigned char msg[8] = { 'F', 'T', 'D', 'L' };
+    msg[4] = queueMs & 0xFF;
+    msg[5] = queueMs >> 8;
+    msg[6] = samples & 0xFF;
+    msg[7] = samples >> 8;
+    sendto(rtpSocket, (char*)msg, sizeof(msg), 0, (struct sockaddr*)&nackAddr, AddrLen);
+}
+
+static void delayReset(uint64_t now) {
+    for (int i = 0; i < DELAY_BASE_SLOTS; i++) {
+        delayBase[i] = INT64_MAX;
+    }
+    delayBaseSlot = 0;
+    delayBaseSlotStartUs = now;
+    delayReportStartUs = now;
+    delaySampleCount = 0;
+}
+
+// Called for packets that advance the highest sequence number, i.e. new packets in send order.
+static void delayObserve(uint32_t timestamp) {
+    uint64_t now = PltGetMicroseconds();
+    if (!delayHaveTs) {
+        delayHaveTs = true;
+        delayLastTs = timestamp;
+        delayTsTicks = 0;
+        delayReset(now);
+    }
+    else if (timestamp == delayLastTs || isBefore32(timestamp, delayLastTs)) {
+        // Not the first packet of a new frame
+        return;
+    }
+    else {
+        delayTsTicks += U32(timestamp - delayLastTs);
+        delayLastTs = timestamp;
+    }
+
+    int64_t delay = (int64_t)now - delayTsTicks * 1000000 / 90000;
+
+    for (int i = 0; i < DELAY_BASE_SLOTS && now - delayBaseSlotStartUs >= 1000000; i++) {
+        delayBaseSlot = (delayBaseSlot + 1) % DELAY_BASE_SLOTS;
+        delayBase[delayBaseSlot] = INT64_MAX;
+        delayBaseSlotStartUs += 1000000;
+    }
+    if (now - delayBaseSlotStartUs >= 1000000) {
+        // Gap longer than the whole window
+        delayBaseSlotStartUs = now;
+    }
+    if (delay < delayBase[delayBaseSlot]) {
+        delayBase[delayBaseSlot] = delay;
+    }
+    if (delaySampleCount < DELAY_MAX_SAMPLES) {
+        delaySamples[delaySampleCount++] = delay;
+    }
+
+    if (now - delayReportStartUs < DELAY_REPORT_US) {
+        return;
+    }
+    delayReportStartUs = now;
+
+    int64_t base = INT64_MAX;
+    for (int i = 0; i < DELAY_BASE_SLOTS; i++) {
+        if (delayBase[i] < base) {
+            base = delayBase[i];
+        }
+    }
+
+    // Median: a handoff stall delays a few frames, a filling queue delays all of them
+    for (int i = 1; i < delaySampleCount; i++) {
+        int64_t v = delaySamples[i];
+        int j = i - 1;
+        while (j >= 0 && delaySamples[j] > v) {
+            delaySamples[j + 1] = delaySamples[j];
+            j--;
+        }
+        delaySamples[j + 1] = v;
+    }
+    int64_t queueUs = delaySamples[delaySampleCount / 2] - base;
+    uint16_t queueMs = (uint16_t)(queueUs < 0 ? 0 : (queueUs / 1000 > 65535 ? 65535 : queueUs / 1000));
+    uint16_t samples = (uint16_t)delaySampleCount;
+    delaySampleCount = 0;
+
+    delaySend(queueMs, samples);
+    delayReports++;
+    if (queueMs >= 15) {
+        delayHighReports++;
+        if (reorderLog != NULL) {
+            fprintf(reorderLog, "%llu delay %u %u\n", (unsigned long long)epochMillis(), queueMs, samples);
+        }
+    }
+    if (queueMs > delayMaxQueueMs) {
+        delayMaxQueueMs = queueMs;
+    }
+}
+
 static void nackObserve(char* buffer) {
     uint16_t seq = ((PRTP_PACKET)buffer)->sequenceNumber;
     if (!nackHaveSeq) {
@@ -243,6 +366,9 @@ static void nackObserve(char* buffer) {
         for (uint16_t s = U16(nackHighestSeq + 1); s != U16(seq + 1); s = U16(s + 1)) {
             NACK_CLEAR(U16(s + 32768));
             NACK_CLEAR(s);
+        }
+        if (delayEnabled) {
+            delayObserve(((PRTP_PACKET)buffer)->timestamp);
         }
         uint16_t missing = U16(seq - nackHighestSeq - 1);
         if (missing > 0 && missing <= 1024) {
@@ -262,6 +388,12 @@ static void reorderInit(int bufferOffset) {
     nackOutstandingCount = 0;
     const char* retry = getenv("FROGTALE_NACK_RETRY_MS");
     nackRetryMs = retry ? atoi(retry) : 35;
+    // Needs the NACK-aware host, so it follows FROGTALE_NACK unless turned off
+    const char* delay = getenv("FROGTALE_DELAY");
+    delayEnabled = nackEnabled && (delay == NULL || atoi(delay) != 0);
+    delayHaveTs = false;
+    delayReports = delayHighReports = 0;
+    delayMaxQueueMs = 0;
     memcpy(&nackAddr, &RemoteAddr, sizeof(nackAddr));
     SET_PORT(&nackAddr, VideoPortNumber);
 
@@ -285,9 +417,10 @@ static void reorderInit(int bufferOffset) {
     reorderLog = fopen(path, "a");
     if (reorderLog != NULL) {
         setvbuf(reorderLog, NULL, _IOLBF, 0);
-        fprintf(reorderLog, "%llu start hold_ms=%d nack=%d\n", (unsigned long long)epochMillis(), reorderHoldMs, nackEnabled);
+        fprintf(reorderLog, "%llu start hold_ms=%d nack=%d delay=%d\n", (unsigned long long)epochMillis(), reorderHoldMs, nackEnabled, delayEnabled);
     }
-    Limelog("FrogtaleTV reorder hold: %d ms, NACK %s\n", reorderHoldMs, nackEnabled ? "on" : "off");
+    Limelog("FrogtaleTV reorder hold: %d ms, NACK %s, delay reports %s\n", reorderHoldMs,
+            nackEnabled ? "on" : "off", delayEnabled ? "on" : "off");
 }
 
 // <0 behind the block the queue is assembling, 0 that block, >0 a later block.
@@ -420,10 +553,11 @@ static void reorderCleanup(void) {
     }
     heldCount = 0;
     if (reorderLog != NULL) {
-        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u nack_ranges=%u nack_packets=%u nack_retries=%u\n",
+        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u nack_ranges=%u nack_packets=%u nack_retries=%u delay_reports=%u delay_high=%u delay_max_ms=%u\n",
                 (unsigned long long)epochMillis(), reorderStats.holds, reorderStats.resolved,
                 reorderStats.timedOut, reorderStats.overflowed,
-                (unsigned int)(reorderStats.maxResolvedUs / 1000), nackRanges, nackPackets, nackRetries);
+                (unsigned int)(reorderStats.maxResolvedUs / 1000), nackRanges, nackPackets, nackRetries,
+                delayReports, delayHighReports, delayMaxQueueMs);
         fclose(reorderLog);
         reorderLog = NULL;
     }
