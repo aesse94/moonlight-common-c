@@ -176,7 +176,9 @@ static void reorderInit(int bufferOffset) {
     SET_PORT(&nackAddr, VideoPortNumber);
 
     const char* ms = getenv("FROGTALE_REORDER_MS");
-    reorderHoldMs = ms ? atoi(ms) : (nackEnabled ? 150 : 80);
+    // GeForce Now waits up to 68 ms for a frame (rtpQueueMaxFrameWaitDurationMs) with a ~35 ms
+    // RTT; over Starlink to a home host the RTT is ~65 ms and NACKed frames completed in 47-83 ms.
+    reorderHoldMs = ms ? atoi(ms) : (nackEnabled ? 100 : 80);
     reorderBufferOffset = bufferOffset;
     heldCount = 0;
     memset(&reorderStats, 0, sizeof(reorderStats));
@@ -358,6 +360,13 @@ static void VideoReceiveThreadProc(void* context) {
 
     reorderInit(decryptedSize);
 
+    // While holding, the timeout is only checked when recv() returns. During a link stall nothing
+    // arrives, so with the stock 100 ms poll a hold overran to ~180 ms. Poll faster when holding.
+    int pollMs = UDP_RECV_POLL_TIMEOUT_MS;
+    if (reorderHoldMs > 0 && !useSelect && setNonFatalRecvTimeoutMs(rtpSocket, 10) == 0) {
+        pollMs = 10;
+    }
+
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
@@ -386,7 +395,7 @@ static void VideoReceiveThreadProc(void* context) {
             if (!receivedDataFromPeer) {
                 // If we wait many seconds without ever receiving a video packet,
                 // assume something is broken and terminate the connection.
-                waitingForVideoMs += UDP_RECV_POLL_TIMEOUT_MS;
+                waitingForVideoMs += pollMs;
                 if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
                     Limelog("Terminating connection due to lack of video traffic\n");
                     ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
