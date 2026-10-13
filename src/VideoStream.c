@@ -129,9 +129,54 @@ static uint64_t epochMillis(void) {
 #endif
 }
 
+// FrogtaleTV patch: NACK lost video packets so a patched host (aesse94/Apollo) resends them.
+// The hold above alone can't help on Starlink because the stalled packets are lost, not late;
+// with FROGTALE_NACK=1 every jump in RTP sequence numbers is reported as "FTNK" + ranges on the
+// video socket, and the hold keeps the frame open (150 ms default) while the resends arrive.
+static bool nackEnabled;
+static bool nackHaveSeq;
+static uint16_t nackHighestSeq;
+static LC_SOCKADDR nackAddr;
+static uint32_t nackRanges, nackPackets;
+
+static void nackSend(uint16_t first, uint16_t length) {
+    // "FTNK", uint16 count, then count x (uint16 first, uint16 length), little endian
+    unsigned char msg[4 + 2 + 4] = { 'F', 'T', 'N', 'K', 1, 0 };
+    msg[6] = first & 0xFF;
+    msg[7] = first >> 8;
+    msg[8] = length & 0xFF;
+    msg[9] = length >> 8;
+    sendto(rtpSocket, (char*)msg, sizeof(msg), 0, (struct sockaddr*)&nackAddr, AddrLen);
+    nackRanges++;
+    nackPackets += length;
+}
+
+static void nackObserve(char* buffer) {
+    uint16_t seq = ((PRTP_PACKET)buffer)->sequenceNumber;
+    if (!nackHaveSeq) {
+        nackHighestSeq = seq;
+        nackHaveSeq = true;
+        return;
+    }
+    if (isBefore16(nackHighestSeq, seq)) {
+        uint16_t missing = U16(seq - nackHighestSeq - 1);
+        if (missing > 0 && missing <= 1024) {
+            nackSend(U16(nackHighestSeq + 1), missing);
+        }
+        nackHighestSeq = seq;
+    }
+}
+
 static void reorderInit(int bufferOffset) {
+    const char* nack = getenv("FROGTALE_NACK");
+    nackEnabled = nack != NULL && atoi(nack) != 0;
+    nackHaveSeq = false;
+    nackRanges = nackPackets = 0;
+    memcpy(&nackAddr, &RemoteAddr, sizeof(nackAddr));
+    SET_PORT(&nackAddr, VideoPortNumber);
+
     const char* ms = getenv("FROGTALE_REORDER_MS");
-    reorderHoldMs = ms ? atoi(ms) : 80;
+    reorderHoldMs = ms ? atoi(ms) : (nackEnabled ? 150 : 80);
     reorderBufferOffset = bufferOffset;
     heldCount = 0;
     memset(&reorderStats, 0, sizeof(reorderStats));
@@ -146,9 +191,9 @@ static void reorderInit(int bufferOffset) {
     reorderLog = fopen(path, "a");
     if (reorderLog != NULL) {
         setvbuf(reorderLog, NULL, _IOLBF, 0);
-        fprintf(reorderLog, "%llu start hold_ms=%d\n", (unsigned long long)epochMillis(), reorderHoldMs);
+        fprintf(reorderLog, "%llu start hold_ms=%d nack=%d\n", (unsigned long long)epochMillis(), reorderHoldMs, nackEnabled);
     }
-    Limelog("FrogtaleTV reorder hold: %d ms\n", reorderHoldMs);
+    Limelog("FrogtaleTV reorder hold: %d ms, NACK %s\n", reorderHoldMs, nackEnabled ? "on" : "off");
 }
 
 // <0 behind the block the queue is assembling, 0 that block, >0 a later block.
@@ -203,6 +248,10 @@ static void reorderDrain(bool force) {
 }
 
 static void reorderProcess(char* buffer, int length) {
+    if (nackEnabled) {
+        nackObserve(buffer);
+    }
+
     if (reorderHoldMs <= 0) {
         submitPacket(buffer, length);
         return;
@@ -260,10 +309,10 @@ static void reorderCleanup(void) {
     }
     heldCount = 0;
     if (reorderLog != NULL) {
-        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u\n",
+        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u nack_ranges=%u nack_packets=%u\n",
                 (unsigned long long)epochMillis(), reorderStats.holds, reorderStats.resolved,
                 reorderStats.timedOut, reorderStats.overflowed,
-                (unsigned int)(reorderStats.maxResolvedUs / 1000));
+                (unsigned int)(reorderStats.maxResolvedUs / 1000), nackRanges, nackPackets);
         fclose(reorderLog);
         reorderLog = NULL;
     }
