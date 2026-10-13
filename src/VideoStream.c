@@ -137,7 +137,24 @@ static bool nackEnabled;
 static bool nackHaveSeq;
 static uint16_t nackHighestSeq;
 static LC_SOCKADDR nackAddr;
-static uint32_t nackRanges, nackPackets;
+static uint32_t nackRanges, nackPackets, nackRetries;
+static int nackRetryMs;
+
+// Received-sequence bitmap, so a NACK can be repeated for whatever is still missing. GeForce Now
+// retries up to 3 times (rtpNackMaxRetries); one lost NACK or resend otherwise costs an IDR.
+#define NACK_MAX_OUTSTANDING 32
+#define NACK_MAX_RETRIES 2
+static uint8_t nackSeen[65536 / 8];
+static struct {
+    uint16_t first, length;
+    uint64_t sentUs;
+    int retries;
+} nackOutstanding[NACK_MAX_OUTSTANDING];
+static int nackOutstandingCount;
+
+#define NACK_SEEN(seq) (nackSeen[(seq) >> 3] & (1 << ((seq) & 7)))
+#define NACK_MARK(seq) (nackSeen[(seq) >> 3] |= (1 << ((seq) & 7)))
+#define NACK_CLEAR(seq) (nackSeen[(seq) >> 3] &= ~(1 << ((seq) & 7)))
 
 static void nackSend(uint16_t first, uint16_t length) {
     // "FTNK", uint16 count, then count x (uint16 first, uint16 length), little endian
@@ -151,27 +168,98 @@ static void nackSend(uint16_t first, uint16_t length) {
     nackPackets += length;
 }
 
+static void nackTrack(uint16_t first, uint16_t length) {
+    if (nackOutstandingCount == NACK_MAX_OUTSTANDING) {
+        // Drop the oldest; it is the least likely to still matter
+        memmove(&nackOutstanding[0], &nackOutstanding[1], sizeof(nackOutstanding[0]) * (NACK_MAX_OUTSTANDING - 1));
+        nackOutstandingCount--;
+    }
+    nackOutstanding[nackOutstandingCount].first = first;
+    nackOutstanding[nackOutstandingCount].length = length;
+    nackOutstanding[nackOutstandingCount].sentUs = PltGetMicroseconds();
+    nackOutstanding[nackOutstandingCount].retries = 0;
+    nackOutstandingCount++;
+}
+
+// Re-request whatever is still missing from earlier NACKs, every nackRetryMs, up to
+// NACK_MAX_RETRIES times. Ranges that are complete or exhausted are dropped.
+static void nackRetry(void) {
+    static uint64_t lastCheckUs;
+    uint64_t now = PltGetMicroseconds();
+    if (now - lastCheckUs < 5000) {
+        return;
+    }
+    lastCheckUs = now;
+
+    int kept = 0;
+    for (int i = 0; i < nackOutstandingCount; i++) {
+        bool missing = false;
+        for (uint16_t j = 0; j < nackOutstanding[i].length && !missing; j++) {
+            missing = !NACK_SEEN(U16(nackOutstanding[i].first + j));
+        }
+        if (!missing) {
+            continue;
+        }
+        if (now - nackOutstanding[i].sentUs >= (uint64_t)nackRetryMs * 1000) {
+            if (nackOutstanding[i].retries >= NACK_MAX_RETRIES) {
+                continue;
+            }
+            // Resend only the sub-ranges that are still missing
+            uint16_t runStart = 0, runLength = 0;
+            for (uint16_t j = 0; j <= nackOutstanding[i].length; j++) {
+                uint16_t seq = U16(nackOutstanding[i].first + j);
+                if (j < nackOutstanding[i].length && !NACK_SEEN(seq)) {
+                    if (runLength++ == 0) {
+                        runStart = seq;
+                    }
+                }
+                else if (runLength > 0) {
+                    nackSend(runStart, runLength);
+                    runLength = 0;
+                }
+            }
+            nackOutstanding[i].sentUs = now;
+            nackOutstanding[i].retries++;
+            nackRetries++;
+        }
+        nackOutstanding[kept++] = nackOutstanding[i];
+    }
+    nackOutstandingCount = kept;
+}
+
 static void nackObserve(char* buffer) {
     uint16_t seq = ((PRTP_PACKET)buffer)->sequenceNumber;
     if (!nackHaveSeq) {
+        memset(nackSeen, 0, sizeof(nackSeen));
         nackHighestSeq = seq;
         nackHaveSeq = true;
+        NACK_MARK(seq);
         return;
     }
     if (isBefore16(nackHighestSeq, seq)) {
+        // Forget the bits half a sequence space ahead so the bitmap never reports stale packets
+        for (uint16_t s = U16(nackHighestSeq + 1); s != U16(seq + 1); s = U16(s + 1)) {
+            NACK_CLEAR(U16(s + 32768));
+            NACK_CLEAR(s);
+        }
         uint16_t missing = U16(seq - nackHighestSeq - 1);
         if (missing > 0 && missing <= 1024) {
             nackSend(U16(nackHighestSeq + 1), missing);
+            nackTrack(U16(nackHighestSeq + 1), missing);
         }
         nackHighestSeq = seq;
     }
+    NACK_MARK(seq);
 }
 
 static void reorderInit(int bufferOffset) {
     const char* nack = getenv("FROGTALE_NACK");
     nackEnabled = nack != NULL && atoi(nack) != 0;
     nackHaveSeq = false;
-    nackRanges = nackPackets = 0;
+    nackRanges = nackPackets = nackRetries = 0;
+    nackOutstandingCount = 0;
+    const char* retry = getenv("FROGTALE_NACK_RETRY_MS");
+    nackRetryMs = retry ? atoi(retry) : 35;
     memcpy(&nackAddr, &RemoteAddr, sizeof(nackAddr));
     SET_PORT(&nackAddr, VideoPortNumber);
 
@@ -295,6 +383,10 @@ static void reorderProcess(char* buffer, int length) {
 }
 
 static void reorderCheckTimeout(void) {
+    if (nackEnabled && nackOutstandingCount > 0) {
+        nackRetry();
+    }
+
     if (heldCount > 0) {
         uint64_t heldUs = PltGetMicroseconds() - holdStartUs;
         if (heldUs >= (uint64_t)reorderHoldMs * 1000) {
@@ -311,10 +403,10 @@ static void reorderCleanup(void) {
     }
     heldCount = 0;
     if (reorderLog != NULL) {
-        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u nack_ranges=%u nack_packets=%u\n",
+        fprintf(reorderLog, "%llu end holds=%u resolved=%u timeout=%u overflow=%u max_resolved_ms=%u nack_ranges=%u nack_packets=%u nack_retries=%u\n",
                 (unsigned long long)epochMillis(), reorderStats.holds, reorderStats.resolved,
                 reorderStats.timedOut, reorderStats.overflowed,
-                (unsigned int)(reorderStats.maxResolvedUs / 1000), nackRanges, nackPackets);
+                (unsigned int)(reorderStats.maxResolvedUs / 1000), nackRanges, nackPackets, nackRetries);
         fclose(reorderLog);
         reorderLog = NULL;
     }
