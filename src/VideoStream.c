@@ -107,6 +107,7 @@ static HELD_PACKET heldPackets[REORDER_MAX_HELD];
 static int heldCount;
 static uint64_t holdStartUs;
 static uint64_t holdSuppressedUntilUs;
+static uint64_t lastTimeoutUs;
 static uint32_t holdStartFrame;
 static int reorderHoldMs;
 static int reorderBufferOffset;
@@ -271,6 +272,7 @@ static void reorderInit(int bufferOffset) {
     reorderBufferOffset = bufferOffset;
     heldCount = 0;
     holdSuppressedUntilUs = 0;
+    lastTimeoutUs = 0;
     memset(&reorderStats, 0, sizeof(reorderStats));
 
     const char* path = getenv("FROGTALE_REORDER_LOG");
@@ -398,7 +400,16 @@ static void reorderCheckTimeout(void) {
             reorderStats.timedOut++;
             logHold("timeout", heldUs, heldCount);
             reorderDrain(true);
-            holdSuppressedUntilUs = PltGetMicroseconds() + 1000000;
+            // Two timeouts within 5 s means a storm (Starlink lost 12-42% for ~30 s at 12:37 on
+            // 2026-10-13, timing out a hold every 1-2 s): resends won't arrive, and each further
+            // hold is just another 100 ms freeze before the RFI. Skip holding for 10 s, else 1 s.
+            uint64_t now = PltGetMicroseconds();
+            bool storm = lastTimeoutUs != 0 && now - lastTimeoutUs < 5000000;
+            holdSuppressedUntilUs = now + (storm ? 10000000 : 1000000);
+            lastTimeoutUs = now;
+            if (storm) {
+                logHold("storm", 0, 0);
+            }
         }
     }
 }
