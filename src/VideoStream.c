@@ -258,6 +258,9 @@ static int delaySampleCount;
 static uint64_t delayReportStartUs;
 static uint32_t delayReports, delayHighReports;
 static uint16_t delayMaxQueueMs;
+// Queueing delay of the newest frame start, for the adaptive hold limit
+static int64_t delayLatestQueueUs;
+static uint64_t delayLatestAtUs;
 
 static void delaySend(uint16_t queueMs, uint16_t samples) {
     // "FTDL", uint16 queue_ms, uint16 samples, little endian. 8 bytes, so a stock host (which only
@@ -311,6 +314,16 @@ static void delayObserve(uint32_t timestamp) {
     }
     if (delay < delayBase[delayBaseSlot]) {
         delayBase[delayBaseSlot] = delay;
+    }
+    {
+        int64_t latestBase = INT64_MAX;
+        for (int i = 0; i < DELAY_BASE_SLOTS; i++) {
+            if (delayBase[i] < latestBase) {
+                latestBase = delayBase[i];
+            }
+        }
+        delayLatestQueueUs = delay - latestBase;
+        delayLatestAtUs = now;
     }
     if (delaySampleCount < DELAY_MAX_SAMPLES) {
         delaySamples[delaySampleCount++] = delay;
@@ -554,9 +567,24 @@ static void reorderCheckTimeout(void) {
     if (heldCount > 0) {
         uint64_t heldUs = PltGetMicroseconds() - holdStartUs;
         int limitMs = holdAtHandoff && reorderHoldMs > 0 ? (reorderHoldMs * 16 / 10) : reorderHoldMs;
+        // A NACKed resend waits in the same queue as everything else, so when the link is queueing
+        // the hold has to cover that too. 2026-10-15 15:57:56: frames arrived 154 ms late, the
+        // 100 ms hold gave up on a frame whose resend was still in the queue, and the RFI that
+        // followed (through the same queue) froze the picture ~350 ms. Extend by the current
+        // queueing delay above Starlink's idle 20 ms, up to 300 ms in total. Calm links: unchanged.
+        if (delayEnabled && reorderHoldMs > 0 && PltGetMicroseconds() - delayLatestAtUs < 500000) {
+            int queueMs = (int)(delayLatestQueueUs / 1000) - 20;
+            if (queueMs > 0) {
+                limitMs += queueMs > 150 ? 150 : queueMs;
+                if (limitMs > 300) {
+                    limitMs = 300;
+                }
+            }
+        }
         if (heldUs >= (uint64_t)limitMs * 1000) {
             reorderStats.timedOut++;
-            logHold(holdAtHandoff ? "timeout-handoff" : "timeout", heldUs, heldCount);
+            logHold(limitMs > (holdAtHandoff ? reorderHoldMs * 16 / 10 : reorderHoldMs) ? "timeout-queue" :
+                    holdAtHandoff ? "timeout-handoff" : "timeout", heldUs, heldCount);
             reorderDrain(true);
             // Two timeouts within 5 s means a storm (Starlink lost 12-42% for ~30 s at 12:37 on
             // 2026-10-13, timing out a hold every 1-2 s): resends won't arrive, and each further
