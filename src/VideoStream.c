@@ -111,6 +111,7 @@ static uint64_t holdSuppressedUntilUs;
 static uint64_t recentHoldStartsUs[HOLD_HISTORY];
 static int recentHoldNext;
 static bool holdAtHandoff;
+static bool holdShort;
 static uint64_t lastTimeoutUs;
 static uint32_t holdStartFrame;
 static int reorderHoldMs;
@@ -499,10 +500,13 @@ static void reorderProcess(char* buffer, int length) {
         nackObserve(buffer);
     }
 
-    // After a hold times out the link is in a long outage; further holds would only stack
-    // another reorderHoldMs each (5 in a row = ~0.5 s of extra freeze), so let the stock RFI
-    // path recover for a second before holding again.
-    if (reorderHoldMs <= 0 || PltGetMicroseconds() < holdSuppressedUntilUs) {
+    // After a hold times out, further full-length holds would stack another reorderHoldMs each
+    // (5 in a row = ~0.5 s of extra freeze), so for a second (10 s in a storm) holds are short:
+    // just long enough for the host's last handoff copy (+120 ms). They used to be off entirely,
+    // which on 2026-10-15 19:19:27 (rain) threw away ~30 frames in a row: the handoff second lost
+    // 30-50% of packets scattered over every frame, and the copies and resends that would have
+    // completed them arrived after the client had already given each frame up.
+    if (reorderHoldMs <= 0) {
         submitPacket(buffer, length);
         return;
     }
@@ -534,6 +538,7 @@ static void reorderProcess(char* buffer, int length) {
 
     if (heldCount == 0) {
         holdStartUs = PltGetMicroseconds();
+        holdShort = holdStartUs < holdSuppressedUntilUs;
         // Starlink handoffs recur every 15 s. A hold starting a whole number of 15 s cycles after the
         // previous one (+-0.5 s) is a handoff stall: on 2026-10-15 those were nearly all the failed
         // recoveries, because a stall longer than the host's copies leaves only NACK resends, and
@@ -581,9 +586,13 @@ static void reorderCheckTimeout(void) {
                 }
             }
         }
+        if (holdShort && limitMs > 130) {
+            limitMs = 130;
+        }
         if (heldUs >= (uint64_t)limitMs * 1000) {
             reorderStats.timedOut++;
-            logHold(limitMs > (holdAtHandoff ? reorderHoldMs * 16 / 10 : reorderHoldMs) ? "timeout-queue" :
+            logHold(holdShort ? "timeout-short" :
+                    limitMs > (holdAtHandoff ? reorderHoldMs * 16 / 10 : reorderHoldMs) ? "timeout-queue" :
                     holdAtHandoff ? "timeout-handoff" : "timeout", heldUs, heldCount);
             reorderDrain(true);
             // Two timeouts within 5 s means a storm (Starlink lost 12-42% for ~30 s at 12:37 on
