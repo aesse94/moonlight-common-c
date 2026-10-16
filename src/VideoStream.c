@@ -549,7 +549,12 @@ static void gapObserve(uint64_t nowUs) {
                     }
                 }
                 int learned = near >= 5 ? median : -1;
-                if (learned >= 0 && abs(phase - median) <= 300) {
+                // Hysteresis: once learned, a noisy patch (random gaps diluting the 5-of-8) keeps the
+                // known phase while stalls still land near it; it lapses only via the 2-minute expiry.
+                if (learned < 0 && handoffPhaseMs >= 0) {
+                    learned = handoffPhaseMs;
+                }
+                if (learned >= 0 && abs(phase - learned) <= 300) {
                     handoffLastGapUs = nowUs;
                 }
                 if ((learned < 0) != (handoffPhaseMs < 0) || (learned >= 0 && abs(learned - handoffPhaseMs) >= 100)) {
