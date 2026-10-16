@@ -514,6 +514,7 @@ static int gapPhases[GAP_PHASES];
 static int gapPhaseCount, gapPhaseNext;
 static uint64_t gapLastPacketUs;
 static volatile int handoffPhaseMs = -1;
+static volatile uint64_t handoffLastGapUs;  // last qualifying gap near the learned phase
 
 static void gapObserve(uint64_t nowUs) {
     if (gapLastPacketUs != 0 && nowUs - gapLastPacketUs >= 40000 && nowUs - gapLastPacketUs < 2000000) {
@@ -537,12 +538,26 @@ static void gapObserve(uint64_t nowUs) {
                     sorted[j + 1] = v;
                 }
                 int median = sorted[gapPhaseCount / 2];
-                if (handoffPhaseMs < 0 || abs(median - handoffPhaseMs) >= 100) {
-                    if (reorderLog != NULL) {
-                        fprintf(reorderLog, "%llu phase %d %d\n", (unsigned long long)epochMillis(), median, gapPhaseCount);
+                // Only a rhythm counts: at least 5 of the last 8 gaps within 300 ms of the median.
+                // Starlink stalls land at the same moment cycle after cycle; random Wi-Fi or cable
+                // gaps that happen to fall 10.5-13.5 s into a cycle spread over the whole 3 s, so
+                // on other links the cushion never runs (it would only add delay there).
+                int near = 0;
+                for (int i = 0; i < gapPhaseCount; i++) {
+                    if (abs(gapPhases[i] - median) <= 300) {
+                        near++;
                     }
                 }
-                handoffPhaseMs = median;
+                int learned = near >= 5 ? median : -1;
+                if (learned >= 0 && abs(phase - median) <= 300) {
+                    handoffLastGapUs = nowUs;
+                }
+                if ((learned < 0) != (handoffPhaseMs < 0) || (learned >= 0 && abs(learned - handoffPhaseMs) >= 100)) {
+                    if (reorderLog != NULL) {
+                        fprintf(reorderLog, "%llu phase %d %d %d\n", (unsigned long long)epochMillis(), learned, gapPhaseCount, near);
+                    }
+                }
+                handoffPhaseMs = learned;
             }
         }
     }
@@ -550,6 +565,11 @@ static void gapObserve(uint64_t nowUs) {
 }
 
 int LiFrogtaleHandoffPhaseMs(void) {
+    // Forget the rhythm after 2 minutes without a stall at the learned moment (left Starlink, or
+    // the link got better): no cushion, no added delay.
+    if (handoffPhaseMs >= 0 && PltGetMicroseconds() - handoffLastGapUs > 120000000ULL) {
+        return -1;
+    }
     return handoffPhaseMs;
 }
 
