@@ -505,7 +505,56 @@ static void reorderDrain(bool force) {
     } while (progress && heldCount > 0);
 }
 
+// FrogtaleTV patch: learn when the Starlink handoff stall happens, for the renderer's handoff
+// cushion (moonlight-qt pacer). A stall shows as no video packets for 40 ms or more; its start
+// within the 15 s cycle sits near :12/:27/:42/:57 (phase 12000) but drifts by up to +-1 s, so
+// keep gaps starting 10.5-13.5 s into the cycle and use the median of the last 8.
+#define GAP_PHASES 8
+static int gapPhases[GAP_PHASES];
+static int gapPhaseCount, gapPhaseNext;
+static uint64_t gapLastPacketUs;
+static volatile int handoffPhaseMs = -1;
+
+static void gapObserve(uint64_t nowUs) {
+    if (gapLastPacketUs != 0 && nowUs - gapLastPacketUs >= 40000 && nowUs - gapLastPacketUs < 2000000) {
+        uint64_t startWall = epochMillis() - (nowUs - gapLastPacketUs) / 1000;
+        int phase = (int)(startWall % 15000);
+        if (phase >= 10500 && phase <= 13500) {
+            gapPhases[gapPhaseNext] = phase;
+            gapPhaseNext = (gapPhaseNext + 1) % GAP_PHASES;
+            if (gapPhaseCount < GAP_PHASES) {
+                gapPhaseCount++;
+            }
+            if (gapPhaseCount >= 3) {
+                int sorted[GAP_PHASES];
+                memcpy(sorted, gapPhases, sizeof(int) * gapPhaseCount);
+                for (int i = 1; i < gapPhaseCount; i++) {
+                    int v = sorted[i], j = i - 1;
+                    while (j >= 0 && sorted[j] > v) {
+                        sorted[j + 1] = sorted[j];
+                        j--;
+                    }
+                    sorted[j + 1] = v;
+                }
+                int median = sorted[gapPhaseCount / 2];
+                if (handoffPhaseMs < 0 || abs(median - handoffPhaseMs) >= 100) {
+                    if (reorderLog != NULL) {
+                        fprintf(reorderLog, "%llu phase %d %d\n", (unsigned long long)epochMillis(), median, gapPhaseCount);
+                    }
+                }
+                handoffPhaseMs = median;
+            }
+        }
+    }
+    gapLastPacketUs = nowUs;
+}
+
+int LiFrogtaleHandoffPhaseMs(void) {
+    return handoffPhaseMs;
+}
+
 static void reorderProcess(char* buffer, int length) {
+    gapObserve(PltGetMicroseconds());
     delayRecvBytes += (uint64_t)length;
     if (nackEnabled) {
         nackObserve(buffer);

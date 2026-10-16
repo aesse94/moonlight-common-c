@@ -865,6 +865,11 @@ uint64_t LiGetMillis(void);
 // network byte order.
 int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, unsigned int* wanAddr);
 
+// FrogtaleTV patch: the moment of the Starlink handoff stall within the 15 s cycle, as
+// (epoch milliseconds % 15000) in this client's wall clock, learned from gaps in video
+// packet arrival. Returns -1 until learned.
+int LiFrogtaleHandoffPhaseMs(void);
+
 // Returns the number of queued video frames ready for delivery. Only relevant
 // if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
 int LiGetPendingVideoFrames(void);
