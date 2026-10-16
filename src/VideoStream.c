@@ -262,15 +262,21 @@ static uint16_t delayMaxQueueMs;
 // Queueing delay of the newest frame start, for the adaptive hold limit
 static int64_t delayLatestQueueUs;
 static uint64_t delayLatestAtUs;
+// Bytes received on the video socket since the last report: the link's delivered rate, which is its
+// capacity while a queue stands (what WebRTC's congestion control steps down to)
+static uint64_t delayRecvBytes;
 
-static void delaySend(uint16_t queueMs, uint16_t samples) {
-    // "FTDL", uint16 queue_ms, uint16 samples, little endian. 8 bytes, so a stock host (which only
-    // looks at 4-byte and SS_PING-sized datagrams) ignores it.
-    unsigned char msg[8] = { 'F', 'T', 'D', 'L' };
+static void delaySend(uint16_t queueMs, uint16_t samples, uint16_t recvKbps) {
+    // "FTDL", uint16 queue_ms, uint16 samples, uint16 recv_kbps, little endian. 10 bytes, so a
+    // stock host (which only looks at 4-byte and SS_PING-sized datagrams) ignores it; an older
+    // FrogtaleTV host reads the first two fields only.
+    unsigned char msg[10] = { 'F', 'T', 'D', 'L' };
     msg[4] = queueMs & 0xFF;
     msg[5] = queueMs >> 8;
     msg[6] = samples & 0xFF;
     msg[7] = samples >> 8;
+    msg[8] = recvKbps & 0xFF;
+    msg[9] = recvKbps >> 8;
     sendto(rtpSocket, (char*)msg, sizeof(msg), 0, (struct sockaddr*)&nackAddr, AddrLen);
 }
 
@@ -333,6 +339,10 @@ static void delayObserve(uint32_t timestamp) {
     if (now - delayReportStartUs < DELAY_REPORT_US) {
         return;
     }
+    uint64_t elapsedUs = now - delayReportStartUs;
+    uint64_t recvKbps64 = elapsedUs ? delayRecvBytes * 8 * 1000 / elapsedUs : 0;
+    uint16_t recvKbps = (uint16_t)(recvKbps64 > 65535 ? 65535 : recvKbps64);
+    delayRecvBytes = 0;
     delayReportStartUs = now;
 
     int64_t base = INT64_MAX;
@@ -357,12 +367,12 @@ static void delayObserve(uint32_t timestamp) {
     uint16_t samples = (uint16_t)delaySampleCount;
     delaySampleCount = 0;
 
-    delaySend(queueMs, samples);
+    delaySend(queueMs, samples, recvKbps);
     delayReports++;
     if (queueMs >= 15) {
         delayHighReports++;
         if (reorderLog != NULL) {
-            fprintf(reorderLog, "%llu delay %u %u\n", (unsigned long long)epochMillis(), queueMs, samples);
+            fprintf(reorderLog, "%llu delay %u %u %u\n", (unsigned long long)epochMillis(), queueMs, samples, recvKbps);
         }
     }
     if (queueMs > delayMaxQueueMs) {
@@ -496,6 +506,7 @@ static void reorderDrain(bool force) {
 }
 
 static void reorderProcess(char* buffer, int length) {
+    delayRecvBytes += (uint64_t)length;
     if (nackEnabled) {
         nackObserve(buffer);
     }
@@ -572,6 +583,14 @@ static void reorderCheckTimeout(void) {
     if (heldCount > 0) {
         uint64_t heldUs = PltGetMicroseconds() - holdStartUs;
         int limitMs = holdAtHandoff && reorderHoldMs > 0 ? (reorderHoldMs * 16 / 10) : reorderHoldMs;
+        int baseLimitMs;
+        // Short holds (see reorderProcess) cover the host's last copy, plus the queue below: on
+        // 2026-10-15 22:00:30 the link queued 200+ ms for 20 s, every short hold gave up at 130 ms
+        // while its resend was still in that queue, and each frame lost became an RFI through it.
+        if (holdShort && limitMs > 130) {
+            limitMs = 130;
+        }
+        baseLimitMs = limitMs;
         // A NACKed resend waits in the same queue as everything else, so when the link is queueing
         // the hold has to cover that too. 2026-10-15 15:57:56: frames arrived 154 ms late, the
         // 100 ms hold gave up on a frame whose resend was still in the queue, and the RFI that
@@ -586,13 +605,10 @@ static void reorderCheckTimeout(void) {
                 }
             }
         }
-        if (holdShort && limitMs > 130) {
-            limitMs = 130;
-        }
         if (heldUs >= (uint64_t)limitMs * 1000) {
             reorderStats.timedOut++;
             logHold(holdShort ? "timeout-short" :
-                    limitMs > (holdAtHandoff ? reorderHoldMs * 16 / 10 : reorderHoldMs) ? "timeout-queue" :
+                    limitMs > baseLimitMs ? "timeout-queue" :
                     holdAtHandoff ? "timeout-handoff" : "timeout", heldUs, heldCount);
             reorderDrain(true);
             // Two timeouts within 5 s means a storm (Starlink lost 12-42% for ~30 s at 12:37 on
